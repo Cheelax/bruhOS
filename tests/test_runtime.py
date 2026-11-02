@@ -3,7 +3,7 @@ import time
 
 from bruhos.brain.adapters.rules import RulesPlanner
 from bruhos.brain.base import Planner
-from bruhos.runtime import Runtime
+from bruhos.runtime import Runtime, RuntimeConfig
 from bruhos.schemas import SkillCall
 from bruhos.sim.kinematic import SimBody, World
 from bruhos.trace import Sink, SinkDispatcher
@@ -93,3 +93,101 @@ def test_failed_sink_does_not_crash():
 def test_out_of_scope_instruction_has_no_plan():
     ep = Runtime(SimBody(), RulesPlanner()).run("Do a backflip.")
     assert not ep.success and ep.end_reason == "no plan for instruction"
+
+
+class StuckBody(SimBody):
+    """A body whose stand-up action groups never get it back on its feet."""
+
+    def _stand_up(self, front):
+        self.world.events.append("stand_up_attempt")
+        return False
+
+
+class CountingPlanner(Planner):
+    name = "counting"
+
+    def __init__(self):
+        self.plans = 0
+
+    def plan(self, instruction, obs, catalog):
+        self.plans += 1
+        return [SkillCall("wave")]
+
+
+def test_recovery_budget_exhausted_when_starting_fallen():
+    body = StuckBody(World(objects=[], fallen=True, fell_forward=False))
+    brain = CountingPlanner()
+    ep = Runtime(body, brain, config=RuntimeConfig(max_recoveries=3)).run("Wave hello.")
+    assert not ep.success
+    assert ep.end_reason == "fallen, recovery budget exhausted"
+    assert ep.recoveries == 3
+    assert [(s.kind, s.call["skill"], s.outcome["status"]) for s in ep.steps] == [("recovery", "stand_up", "failed")] * 3
+    assert ep.plan == [] and brain.plans == 0            # never planned while still on the floor
+    assert body.world.fallen and "wave" not in body.world.events
+
+
+def test_recovery_budget_exhausted_after_a_fall_mid_episode():
+    body = StuckBody(falls_at={4})
+    ep = Runtime(body, RulesPlanner(), config=RuntimeConfig(max_recoveries=2)).run("Put the red one in the box.")
+    assert not ep.success
+    assert ep.end_reason == "fallen, recovery budget exhausted"
+    assert ep.falls == 1 and ep.recoveries == 2
+    kinds = [s.kind for s in ep.steps]
+    assert kinds.count("recovery") == 2 and kinds[-1] == "recovery"
+    assert ep.steps[kinds.index("recovery") - 1].outcome["status"] == "fallen"
+    assert "in_box:red_block" not in body.world.events
+
+
+class ReplanningPlanner(Planner):
+    """First plan fails on a target that is not in the world; ``replan`` decides what happens next."""
+
+    name = "replanning"
+
+    def __init__(self, second):
+        self.second = second
+        self.histories = []
+
+    def plan(self, instruction, obs, catalog):
+        return [SkillCall("walk_toward", {"target": "purple_block"}), SkillCall("wave")]
+
+    def replan(self, instruction, obs, catalog, history):
+        self.histories.append(history)
+        return list(self.second)
+
+
+def test_failed_skill_triggers_one_replan_with_history():
+    body = SimBody()
+    brain = ReplanningPlanner(second=[SkillCall("wave")])
+    ep = Runtime(body, brain).run("Fetch the purple block.")
+    assert ep.success and ep.end_reason == "completed"
+    assert len(brain.histories) == 1
+    failed = brain.histories[0][-1]
+    assert failed["call"] == {"skill": "walk_toward", "args": {"target": "purple_block", "stop_distance_m": 0.1}}
+    assert failed["outcome"]["status"] == "failed"
+    assert [(s.call["skill"], s.outcome["status"]) for s in ep.steps] == [("walk_toward", "failed"), ("wave", "ok")]
+    assert [c["skill"] for c in ep.plan] == ["walk_toward", "wave", "wave"]
+    assert body.world.events == ["wave"]                 # the first plan's wave never ran
+
+
+def test_second_failure_ends_the_episode_without_another_replan():
+    brain = ReplanningPlanner(second=[SkillCall("walk_toward", {"target": "purple_block"})])
+    ep = Runtime(SimBody(), brain).run("Fetch the purple block.")
+    assert not ep.success
+    assert ep.end_reason.startswith("walk_toward failed: purple_block not found")
+    assert len(brain.histories) == 1
+    assert [s.outcome["status"] for s in ep.steps] == ["failed", "failed"]
+
+
+def test_empty_replan_ends_with_the_failed_skill():
+    brain = ReplanningPlanner(second=[])
+    ep = Runtime(SimBody(), brain).run("Fetch the purple block.")
+    assert not ep.success
+    assert ep.end_reason.startswith("walk_toward failed")
+    assert len(brain.histories) == 1 and len(ep.steps) == 1
+
+
+def test_no_replan_when_budget_is_zero():
+    brain = ReplanningPlanner(second=[SkillCall("wave")])
+    ep = Runtime(SimBody(), brain, config=RuntimeConfig(max_replans=0)).run("Fetch the purple block.")
+    assert not ep.success and ep.end_reason.startswith("walk_toward failed")
+    assert brain.histories == [] and len(ep.steps) == 1
